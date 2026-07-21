@@ -1,5 +1,5 @@
 # 未署名 iOS IPA を GitHub Actions（無料 macOS ランナー）でビルドする
-# 使い方: GitHub リポジトリの Actions タブ → "Build unsigned iOS IPA" → Run workflow
+# main への push・タグ push・手動実行（Actions タブ → Run workflow）で起動。
 # 出来上がった Akasha-unsigned.ipa を Artifacts からダウンロードし、
 # Windows の Sideloadly + 無料 Apple ID で iPhone にインストールする（7日ごと再署名）。
 name: Build unsigned iOS IPA
@@ -7,6 +7,7 @@ name: Build unsigned iOS IPA
 on:
   workflow_dispatch:
   push:
+    branches: [main]
     tags: ['v*']
 
 jobs:
@@ -26,32 +27,74 @@ jobs:
 
       - name: Expo prebuild (generate ios/)
         run: npx expo prebuild --platform ios --no-install
+        env:
+          CI: '1'
 
       - name: Install CocoaPods
         run: |
+          set -o pipefail
           cd ios
-          pod install
+          pod install 2>&1 | tee ../pod-install.log
+        env:
+          LANG: en_US.UTF-8
 
       - name: Build (unsigned)
         run: |
+          set -o pipefail
           xcodebuild \
             -workspace ios/Akasha.xcworkspace \
             -scheme Akasha \
             -configuration Release \
-            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
             -derivedDataPath build \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO
+            CODE_SIGNING_ALLOWED=NO \
+            2>&1 | tee xcodebuild.log
 
       - name: Package IPA
         run: |
+          APP_PATH=$(find build/Build/Products -name '*.app' -maxdepth 2 | head -1)
+          echo "APP_PATH=$APP_PATH"
           mkdir -p Payload
-          cp -r build/Build/Products/Release-iphoneos/Akasha.app Payload/
-          zip -r Akasha-unsigned.ipa Payload
+          cp -r "$APP_PATH" Payload/
+          zip -qr Akasha-unsigned.ipa Payload
+          ls -la Akasha-unsigned.ipa
 
       - uses: actions/upload-artifact@v4
         with:
           name: Akasha-unsigned-ipa
           path: Akasha-unsigned.ipa
           retention-days: 30
+
+      # ---- 失敗時診断: ログ末尾を実行サマリーに出す（ログイン不要で見える） ----
+      - name: Failure diagnostics
+        if: failure()
+        run: |
+          {
+            echo "## Build failure diagnostics"
+            echo ""
+            echo "### xcodebuild errors (grep)"
+            echo '```'
+            grep -E "error:|fatal error:|The following build commands failed" -A 2 xcodebuild.log 2>/dev/null | tail -80 || echo "(no xcodebuild.log)"
+            echo '```'
+            echo "### xcodebuild.log tail"
+            echo '```'
+            tail -60 xcodebuild.log 2>/dev/null || echo "(no xcodebuild.log)"
+            echo '```'
+            echo "### pod-install.log tail"
+            echo '```'
+            tail -40 pod-install.log 2>/dev/null || echo "(no pod-install.log)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            xcodebuild.log
+            pod-install.log
+          if-no-files-found: ignore
+          retention-days: 7
