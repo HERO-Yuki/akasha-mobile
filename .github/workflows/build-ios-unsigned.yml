@@ -23,13 +23,13 @@ jobs:
           cache: npm
 
       # Expo SDK 57 は Swift 6.2 (= Xcode 26系) を要求する。
-      # ただし最新の 26.3 では expo-modules-jsi がコンパイルエラーになるため、
-      # ランナーにある 26系のうち最も古いもの（SDK 57 検証済み世代）を選ぶ。
-      - name: Select Xcode 26.x (oldest available)
+      # expo-modules-jsi は `weak let`（新構文）を使うため古い 26.0.x では通らず、
+      # 最新 26.3 では Date.swift の1行だけが型推論エラーになる（後段のパッチで解消）。
+      # → 最新の Xcode を選び、問題の1行はパッチする方針。
+      - name: Select latest Xcode
         run: |
           ls -d /Applications/Xcode*.app
-          PICK=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | head -1)
-          if [ -z "$PICK" ]; then PICK=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1); fi
+          PICK=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
           echo "Selecting: $PICK"
           sudo xcode-select -s "$PICK"
           xcodebuild -version
