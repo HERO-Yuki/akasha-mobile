@@ -1,0 +1,15 @@
+export const C = {
+  accent: '#E8884D',
+  accentStrong: '#F09A62',
+  accentSoft: 'rgba(232,136,77,0.14)',
+  bg: '#17181C',
+  elev1: '#1F2127',
+  elev2: '#262932',
+  hover: '#2C303B',
+  border: '#3A3F4C',
+  text: '#E8E8EA',
+  dim: '#9A9EA9',
+  faint: '#6A6E79',
+  ok: '#7BC47F',
+  danger: '#E06C6C',
+};

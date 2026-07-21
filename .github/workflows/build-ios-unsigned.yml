@@ -1,0 +1,57 @@
+# 未署名 iOS IPA を GitHub Actions（無料 macOS ランナー）でビルドする
+# 使い方: GitHub リポジトリの Actions タブ → "Build unsigned iOS IPA" → Run workflow
+# 出来上がった Akasha-unsigned.ipa を Artifacts からダウンロードし、
+# Windows の Sideloadly + 無料 Apple ID で iPhone にインストールする（7日ごと再署名）。
+name: Build unsigned iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Expo prebuild (generate ios/)
+        run: npx expo prebuild --platform ios --no-install
+
+      - name: Install CocoaPods
+        run: |
+          cd ios
+          pod install
+
+      - name: Build (unsigned)
+        run: |
+          xcodebuild \
+            -workspace ios/Akasha.xcworkspace \
+            -scheme Akasha \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Package IPA
+        run: |
+          mkdir -p Payload
+          cp -r build/Build/Products/Release-iphoneos/Akasha.app Payload/
+          zip -r Akasha-unsigned.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Akasha-unsigned-ipa
+          path: Akasha-unsigned.ipa
+          retention-days: 30
