@@ -22,19 +22,33 @@ jobs:
           node-version: 22
           cache: npm
 
-      # Expo SDK 57 は Swift 6.2 (= Xcode 26系) を要求するため、
-      # ランナーに入っている最新の Xcode を明示的に選択する
-      - name: Select latest Xcode
+      # Expo SDK 57 は Swift 6.2 (= Xcode 26系) を要求する。
+      # ただし最新の 26.3 では expo-modules-jsi がコンパイルエラーになるため、
+      # ランナーにある 26系のうち最も古いもの（SDK 57 検証済み世代）を選ぶ。
+      - name: Select Xcode 26.x (oldest available)
         run: |
           ls -d /Applications/Xcode*.app
-          LATEST=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
-          echo "Selecting: $LATEST"
-          sudo xcode-select -s "$LATEST"
+          PICK=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | head -1)
+          if [ -z "$PICK" ]; then PICK=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1); fi
+          echo "Selecting: $PICK"
+          sudo xcode-select -s "$PICK"
           xcodebuild -version
           swift --version
 
       - name: Install dependencies
         run: npm ci
+
+      # Xcode 26.3 の Swift で型推論エラーになる1行を等価コードに置換
+      # （abs(x) <= y → x.magnitude <= y。どの Swift バージョンでも同じ意味）
+      - name: Patch expo-modules-jsi for newest Swift
+        run: |
+          F=node_modules/expo-modules-jsi/apple/Sources/ExpoModulesJSI/Coding/JavaScriptCodable+Date.swift
+          if [ -f "$F" ]; then
+            sed -i '' 's/abs(milliseconds) <= maxJavaScriptDateMilliseconds/milliseconds.magnitude <= maxJavaScriptDateMilliseconds/' "$F"
+            grep -n "maxJavaScriptDateMilliseconds" "$F" || true
+          else
+            echo "patch target not found (version changed?) — skipping"
+          fi
 
       - name: Expo prebuild (generate ios/)
         run: npx expo prebuild --platform ios --no-install
