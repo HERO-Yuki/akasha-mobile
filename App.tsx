@@ -68,11 +68,22 @@ const A_TRASH: SwipeAction = {
 const A_INBOX: SwipeAction = {
   dest: '', view: 'inbox', label: 'Inbox へ戻す', done: 'Inbox へ戻しました', tone: 'normal',
 };
+/** お気に入りは終点なので「送り出す」先が無い。左右どちらに引いてもアーカイブへ戻す */
+const A_ARCHIVE_BACK: SwipeAction = {
+  dest: ARCHIVE_DIR, view: 'archive', label: 'アーカイブへ戻す', done: 'アーカイブへ戻しました', tone: 'normal',
+};
 
 const SWIPE: Record<ViewName, SwipeSet> = {
   inbox:    { shallow: A_ARCHIVE,  deep: A_FAVORITE },
   archive:  { shallow: A_FAVORITE, deep: A_TRASH, right: A_INBOX },
-  favorite: { right: A_ARCHIVE },
+  favorite: { shallow: A_ARCHIVE_BACK, right: A_ARCHIVE_BACK },
+};
+
+/** 各ビューで一度スワイプするまで出す操作ガイド（使ったら消える） */
+const SWIPE_HINT: Record<ViewName, string> = {
+  inbox: '行を左にスワイプ → 浅く: アーカイブへ ／ 深く: ★ お気に入りへ',
+  archive: '左に浅く: ★ お気に入り ／ 深く: 削除　　右: Inbox へ戻す',
+  favorite: '左右どちらかにスワイプ → アーカイブへ戻す',
 };
 
 function fmtTime(s: number): string {
@@ -365,6 +376,16 @@ export default function App() {
     );
   }, []);
 
+  /** そのビューで一度スワイプしたら操作ガイドを引っ込める */
+  const markSwipeUsed = useCallback((v: ViewName) => {
+    loadDB().then((d) => {
+      if (d.settings.swipeHintDone[v]) return;
+      d.settings.swipeHintDone[v] = true;
+      persist();
+      setDb({ ...d });
+    });
+  }, []);
+
   /* ---------- スワイプ1回ぶんの仕分け（取り消し付き） ---------- */
   const runAction = useCallback(
     async (t: Track, act: SwipeAction) => {
@@ -595,7 +616,7 @@ export default function App() {
   const emptyText: Record<ViewName, string> = {
     inbox: '聴くものはありません。おつかれさま。',
     archive: 'アーカイブは空です。\n聴き終えたものがここに溜まります。',
-    favorite: 'まだ何もありません。\nアーカイブで行を左にスワイプすると ★ に入ります。',
+    favorite: 'まだ何もありません。\nアーカイブで行を左にスワイプすると ★ に入ります。\n（★ から戻すときは左右どちらかにスワイプ）',
   };
 
   return (
@@ -643,6 +664,13 @@ export default function App() {
         </Pressable>
       )}
 
+      {/* 初回だけ出す操作ガイド。一度スワイプすれば以後この行は消える */}
+      {visible.length > 0 && !db.settings.swipeHintDone[view] && (
+        <Pressable style={press(s.hintBar)} onPress={() => markSwipeUsed(view)}>
+          <Text style={s.hintText}>{SWIPE_HINT[view]}</Text>
+        </Pressable>
+      )}
+
       {view === 'archive' && archiveTracks.length > 0 && (
         <Pressable
           style={press(s.bulkBtn)}
@@ -670,7 +698,10 @@ export default function App() {
           const isCur = current?.pathLower === item.pathLower;
           const isPreparing = preparing === item.pathLower;
           return (
-            <SwipeableRow actions={SWIPE[view]} onAction={(a) => runAction(item, a)}>
+            <SwipeableRow
+              actions={SWIPE[view]}
+              onAction={(a) => { markSwipeUsed(view); runAction(item, a); }}
+            >
               <Pressable
                 style={press(
                   [s.row, isCur && s.rowCurrent] as ViewStyle[],
@@ -937,6 +968,11 @@ const s = StyleSheet.create({
     borderRadius: 9, backgroundColor: C.accentSoft, borderWidth: 1, borderColor: C.accent,
   },
   pendingText: { color: C.accentStrong, fontSize: 12 },
+  hintBar: {
+    marginHorizontal: 14, marginBottom: 8, paddingVertical: 6, paddingHorizontal: 10,
+    borderRadius: 9, backgroundColor: C.elev1,
+  },
+  hintText: { color: C.faint, fontSize: 11 },
   bulkBtn: {
     marginHorizontal: 14, marginBottom: 8, paddingVertical: 8, borderRadius: 9,
     borderWidth: 1, borderColor: C.danger, alignItems: 'center',

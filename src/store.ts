@@ -16,6 +16,8 @@ export interface Settings {
   speed: number;
   autoplayNext: boolean;
   autoArchive: boolean;
+  /** ビューごとに一度スワイプしたか。操作ガイドを出すか判断するのに使う */
+  swipeHintDone: Record<string, boolean>;
 }
 
 /** 失敗した移動。アプリを開き直したとき／再読み込み時に自動で再試行する */
@@ -34,7 +36,7 @@ export interface DB {
   pending: PendingMove[];
 }
 
-const DEFAULTS: Settings = { speed: 1, autoplayNext: true, autoArchive: true };
+const DEFAULTS: Settings = { speed: 1, autoplayNext: true, autoArchive: true, swipeHintDone: {} };
 
 let cache: DB | null = null;
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -49,6 +51,8 @@ export async function loadDB(): Promise<DB> {
       settings: { ...DEFAULTS, ...(parsed.settings ?? {}) },
       pending: Array.isArray(parsed.pending) ? parsed.pending : [],
     };
+    // 旧バージョンの保存データにはキーが無いので補う
+    if (!cache.settings.swipeHintDone) cache.settings.swipeHintDone = {};
   } catch {
     cache = { positions: {}, settings: { ...DEFAULTS }, pending: [] };
   }
