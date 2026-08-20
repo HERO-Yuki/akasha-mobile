@@ -14,6 +14,7 @@ import {
   Pressable, RefreshControl, SafeAreaView, ScrollView, StatusBar, StyleSheet,
   Text, View, ViewStyle,
 } from 'react-native';
+import type { PanResponderInstance } from 'react-native';
 import { useAudioPlayer, useAudioPlayerStatus, setAudioModeAsync } from 'expo-audio';
 import * as WebBrowser from 'expo-web-browser';
 import * as Haptics from 'expo-haptics';
@@ -107,10 +108,12 @@ const press =
 function SwipeableRow({
   actions,
   onAction,
+  onSwipeActive,
   children,
 }: {
   actions: SwipeSet;
   onAction: (a: SwipeAction) => void;
+  onSwipeActive: (active: boolean) => void;
   children: React.ReactNode;
 }) {
   const tx = useRef(new Animated.Value(0)).current;
@@ -121,35 +124,90 @@ function SwipeableRow({
   // PanResponder は作り直さない。最新の値は ref 経由で読む
   const actRef = useRef(actions);
   const onActionRef = useRef(onAction);
+  const onActiveRef = useRef(onSwipeActive);
   const armedRef = useRef<SwipeAction | null>(null);
+  /** このタッチを縦スクロールと横スワイプのどちらに使うか。一度決めたら指を離すまで変えない */
+  const lockRef = useRef<'none' | 'h' | 'v'>('none');
+  /** 方向判定に使った移動量。これを引かないと掴んだ瞬間に行がその分ジャンプする */
+  const originRef = useRef(0);
   actRef.current = actions;
   onActionRef.current = onAction;
+  onActiveRef.current = onSwipeActive;
+
+  // 画面から外れるときにアニメーションを止める（途中の値で固まらせない）
+  useEffect(() => () => { tx.stopAnimation(); }, [tx]);
 
   const enabled = !!(actions.shallow || actions.deep || actions.right);
 
-  const pan = useRef(
-    PanResponder.create({
-      // 横方向にはっきり動いたときだけ引き取る（縦スクロールを邪魔しない）
+  const panRef = useRef<PanResponderInstance | null>(null);
+  if (!panRef.current) {
+    /** 指を離した／横取りされたときの後始末。必ずここを通して 0 に戻す */
+    const settle = (dx: number) => {
+      lockRef.current = 'none';
+      const fire = armedRef.current;
+      armedRef.current = null;
+      setArmed(null);
+      setDir(0);
+      onActiveRef.current(false);
+      if (fire) {
+        // 背景は出したまま送り出す（先に消すと何が起きたのか分からない）
+        Animated.timing(tx, {
+          toValue: dx < 0 ? -520 : 520,
+          duration: 140,
+          useNativeDriver: false,
+        }).start(() => {
+          onActionRef.current(fire);
+          tx.setValue(0);
+          setDragging(false);
+        });
+      } else {
+        Animated.spring(tx, {
+          toValue: 0, useNativeDriver: false, bounciness: 0, speed: 20,
+        }).start(() => setDragging(false));
+      }
+    };
+
+    panRef.current = PanResponder.create({
+      // 指を置き直すたびに方向判定をやり直す
+      onStartShouldSetPanResponderCapture: () => {
+        lockRef.current = 'none';
+        return false;
+      },
       onMoveShouldSetPanResponder: (_e, g) => {
         const a = actRef.current;
         if (!a.shallow && !a.deep && !a.right) return false;
-        return Math.abs(g.dx) > 12 && Math.abs(g.dx) > Math.abs(g.dy) * 1.6;
+        if (lockRef.current === 'v') return false;   // 縦と決めたらこのタッチ中は横を取らない
+        if (lockRef.current === 'h') return true;
+        const adx = Math.abs(g.dx);
+        const ady = Math.abs(g.dy);
+        // 先にはっきり動いた方へ一度だけ倒す。どちらとも言えない間は保留する
+        if (ady > 10 && ady >= adx) { lockRef.current = 'v'; return false; }
+        if (adx > 14 && adx > ady * 1.4) { lockRef.current = 'h'; return true; }
+        return false;
       },
-      onPanResponderGrant: () => setDragging(true),
+      // 一度掴んだらリストのスクロールに渡さない（途中で奪われると行が取り残される）
+      onPanResponderTerminationRequest: () => false,
+      onShouldBlockNativeResponder: () => true,
+      onPanResponderGrant: (_e, g) => {
+        originRef.current = g.dx;
+        setDragging(true);
+        onActiveRef.current(true);
+      },
       onPanResponderMove: (_e, g) => {
         const a = actRef.current;
+        const dx = g.dx - originRef.current;
         const hasLeft = !!(a.shallow || a.deep);
         const hasRight = !!a.right;
         // 行き先が無い方向は抵抗をかけて「ここには何も無い」と伝える
-        const resist = (g.dx < 0 && !hasLeft) || (g.dx > 0 && !hasRight);
-        tx.setValue(resist ? g.dx / 4 : g.dx);
-        setDir(g.dx === 0 ? 0 : g.dx < 0 ? -1 : 1);
+        const resist = (dx < 0 && !hasLeft) || (dx > 0 && !hasRight);
+        tx.setValue(resist ? dx / 4 : dx);
+        setDir(dx === 0 ? 0 : dx < 0 ? -1 : 1);
 
         let next: SwipeAction | null = null;
-        if (g.dx < 0 && hasLeft) {
-          if (-g.dx >= DEEP && a.deep) next = a.deep;
-          else if (-g.dx >= SHALLOW) next = a.shallow ?? a.deep ?? null;
-        } else if (g.dx > 0 && hasRight && g.dx >= SHALLOW) {
+        if (dx < 0 && hasLeft) {
+          if (-dx >= DEEP && a.deep) next = a.deep;
+          else if (-dx >= SHALLOW) next = a.shallow ?? a.deep ?? null;
+        } else if (dx > 0 && hasRight && dx >= SHALLOW) {
           next = a.right!;
         }
         if (next !== armedRef.current) {
@@ -164,34 +222,11 @@ function SwipeableRow({
           }
         }
       },
-      onPanResponderRelease: (_e, g) => {
-        setDragging(false);
-        const fire = armedRef.current;
-        armedRef.current = null;
-        setArmed(null);
-        setDir(0);
-        if (fire) {
-          Animated.timing(tx, {
-            toValue: g.dx < 0 ? -480 : 480,
-            duration: 150,
-            useNativeDriver: true,
-          }).start(() => {
-            onActionRef.current(fire);
-            tx.setValue(0);
-          });
-        } else {
-          Animated.spring(tx, { toValue: 0, useNativeDriver: true, bounciness: 0 }).start();
-        }
-      },
-      onPanResponderTerminate: () => {
-        setDragging(false);
-        armedRef.current = null;
-        setArmed(null);
-        setDir(0);
-        Animated.spring(tx, { toValue: 0, useNativeDriver: true, bounciness: 0 }).start();
-      },
-    }),
-  ).current;
+      onPanResponderRelease: (_e, g) => settle(g.dx - originRef.current),
+      onPanResponderTerminate: () => settle(0),
+    });
+  }
+  const pan = panRef.current;
 
   if (!enabled) return <>{children}</>;
 
@@ -287,6 +322,9 @@ export default function App() {
   const [tracks, setTracks] = useState<Track[]>([]);
   const [view, setView] = useState<ViewName>('inbox');
   const [loading, setLoading] = useState(false);
+  // 横スワイプ中はリストの縦スクロールを止める（同時に効くと両方が中途半端になる）
+  const [swiping, setSwiping] = useState(false);
+  const handleSwipeActive = useCallback((a: boolean) => setSwiping(a), []);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -686,6 +724,7 @@ export default function App() {
       <FlatList
         data={visible}
         keyExtractor={(t) => t.pathLower}
+        scrollEnabled={!swiping}
         refreshControl={
           <RefreshControl refreshing={loading} onRefresh={reload} tintColor={C.accent} />
         }
@@ -700,6 +739,7 @@ export default function App() {
           return (
             <SwipeableRow
               actions={SWIPE[view]}
+              onSwipeActive={handleSwipeActive}
               onAction={(a) => { markSwipeUsed(view); runAction(item, a); }}
             >
               <Pressable
