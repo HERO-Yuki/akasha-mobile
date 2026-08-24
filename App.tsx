@@ -29,6 +29,7 @@ import {
 } from './src/dropbox';
 import { DB, loadDB, persist, queueMove, remapPosition } from './src/store';
 import { ErrorInfo, describeError } from './src/errors';
+import { loadSigningExpiry, fmtExpiry, remainingLabel } from './src/signing';
 
 WebBrowser.maybeCompleteAuthSession();
 
@@ -40,6 +41,10 @@ type ViewName = 'inbox' | 'archive' | 'favorite';
  * 左（右→左）＝送り出す。浅い＝そのビューで一番よく使う行き先、深い＝もう一段強い操作。
  * 右（左→右）＝ひとつ戻す。
  */
+/** 署名の残りがこれを切ったら警告を出す。自動再署名は期限の4日前に走るので、
+ *  3日を切っている＝自動再署名が一度は空振りしている、という意味になる */
+const SIGN_WARN_DAYS = 3;
+
 const SHALLOW = 56;   // これを超えたら浅い側が発動
 const DEEP = 140;     // これを超えたら深い側が発動
 
@@ -324,11 +329,15 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   // 横スワイプ中はリストの縦スクロールを止める（同時に効くと両方が中途半端になる）
   const [swiping, setSwiping] = useState(false);
+  // サイドロード署名の期限（無料Apple IDは7日で切れる）
+  const [expiry, setExpiry] = useState<Date | null>(null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
   const handleSwipeActive = useCallback((a: boolean) => setSwiping(a), []);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     loadDB().then(setDb);
+    loadSigningExpiry().then(setExpiry);
     setAudioModeAsync({
       playsInSilentMode: true,
       shouldPlayInBackground: true,
@@ -383,6 +392,8 @@ export default function App() {
   useEffect(() => {
     const sub = AppState.addEventListener('change', (st) => {
       if (st !== 'active') return;
+      setNowMs(Date.now());
+      loadSigningExpiry().then(setExpiry);   // 再署名されていれば期限が伸びている
       flushPending()
         .then((n) => { if (n > 0) { showToast(`保留していた移動 ${n}件を完了しました`); reload(); } })
         .catch(() => {});
@@ -635,6 +646,9 @@ export default function App() {
     );
   }
 
+  const signMsLeft = expiry ? expiry.getTime() - nowMs : null;
+  const signUrgent = signMsLeft != null && signMsLeft < 86400000; // 残り1日を切ったら赤
+
   const pctOf = (t: Track) => {
     const r = db.positions[t.pathLower];
     return r && r.dur > 0 ? Math.min(1, r.pos / r.dur) : 0;
@@ -685,6 +699,33 @@ export default function App() {
           <Text style={s.signout}>接続解除</Text>
         </Pressable>
       </View>
+
+      {signMsLeft != null && signMsLeft < SIGN_WARN_DAYS * 86400000 && (
+        <Pressable
+          style={press(signUrgent ? s.signBarUrgent : s.signBar)}
+          onPress={() =>
+            Alert.alert(
+              remainingLabel(signMsLeft),
+              [
+                `${expiry ? fmtExpiry(expiry) : ''} に署名が切れます。`,
+                '',
+                '無料Apple IDで署名したアプリは7日で開けなくなります。',
+                '切れても再生位置・お気に入り・Dropbox接続は消えません。',
+                '',
+                '【いま出来ること】',
+                '・iPhone をPCと同じ Wi-Fi に繋いでおく（Auto Refresh が再署名します）',
+                '・急ぐなら USB 接続して Sideloadly で同じ IPA を入れ直す',
+              ].join('\n'),
+              [{ text: 'OK' }],
+            )
+          }
+        >
+          <Text style={signUrgent ? s.signTextUrgent : s.signText}>
+            {remainingLabel(signMsLeft)}
+            {expiry ? `（${fmtExpiry(expiry)}）` : ''} — タップで対処方法
+          </Text>
+        </Pressable>
+      )}
 
       {db.pending.length > 0 && (
         <Pressable
@@ -1008,6 +1049,16 @@ const s = StyleSheet.create({
     borderRadius: 9, backgroundColor: C.accentSoft, borderWidth: 1, borderColor: C.accent,
   },
   pendingText: { color: C.accentStrong, fontSize: 12 },
+  signBar: {
+    marginHorizontal: 14, marginBottom: 8, paddingVertical: 7, paddingHorizontal: 10,
+    borderRadius: 9, backgroundColor: C.accentSoft, borderWidth: 1, borderColor: C.accent,
+  },
+  signText: { color: C.accentStrong, fontSize: 12, fontWeight: '600' },
+  signBarUrgent: {
+    marginHorizontal: 14, marginBottom: 8, paddingVertical: 7, paddingHorizontal: 10,
+    borderRadius: 9, backgroundColor: 'rgba(224,108,108,0.16)', borderWidth: 1, borderColor: C.danger,
+  },
+  signTextUrgent: { color: C.danger, fontSize: 12, fontWeight: '700' },
   hintBar: {
     marginHorizontal: 14, marginBottom: 8, paddingVertical: 6, paddingHorizontal: 10,
     borderRadius: 9, backgroundColor: C.elev1,

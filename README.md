@@ -16,6 +16,23 @@ Dropbox の `/podcast` を参照するポッドキャスト風音声プレイヤ
 - 倍速（0.5x〜2.0x・ピッチ維持）、-15s/+30s、連続再生
 - 失敗した移動は保留キューに積まれ、アプリに戻ったときに自動で再試行（v0.2）
 - エラーは「コード + 原因 + 対処 + 生ログ」の4点で表示（v0.2）
+- **署名期限のカウントダウン**（v0.3）。残り3日を切ると警告バーが出る
+
+## 署名期限のカウントダウン（v0.3）
+
+無料Apple IDの署名は7日で切れ、切れるとアプリが開けなくなる（データは消えない）。
+Auto Refresh を有効にしていても、**その時刻に iPhone が PC から見えていなければ再署名は走らない**。
+実際に 2026-08-24 に、Auto Refresh は ON のまま端末が検出されず期限切れになった。
+突然使えなくなるのを防ぐため、アプリ内に残り時間を出す。
+
+- **期限の出所は `embedded.mobileprovision` の `ExpirationDate`**（`src/signing.ts`）。
+  日数を推測しない。Sideloadly が署名時に埋め込む本物の値を読む
+- 残り **3日** を切ると警告バーを表示。自動再署名は期限の96時間前（4日前）に走るので、
+  3日を切っている＝**自動再署名が一度は空振りしている**という意味になる
+- 残り **1日** を切ると赤に変わる。タップすると対処方法が出る
+- アプリ復帰（`AppState` active）のたびに読み直すので、再署名すれば自動で伸びる
+- 未署名ビルド・シミュレータ・Expo Go では読めないので**何も出さない**
+  （一度読めた値は AsyncStorage に控え、読めなかった回のフォールバックにする）
 
 ## スワイプの割り当て
 
@@ -152,6 +169,7 @@ App.tsx                 # UI・再生・スワイプ操作・一括削除フロ�
 src/config.ts           # App key・フォルダ名・視聴済み閾値
 src/dropbox.ts          # OAuth(PKCE+refresh) / list_folder / move_v2 / temporary_link
 src/errors.ts           # エラーの構造化と「原因・対処」への翻訳
+src/signing.ts          # 署名期限（embedded.mobileprovision の ExpirationDate）
 src/store.ts            # 再生位置・設定・保留中の移動（AsyncStorage）
 src/theme.ts            # カラー（#E8884D アクセント）
 .github/workflows/build-ios-unsigned.yml  # 未署名IPAビルド
