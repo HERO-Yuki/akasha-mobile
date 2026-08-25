@@ -12,12 +12,17 @@ export interface PositionRecord {
   last?: number;
 }
 
+/** 名前順は「かな始まり」だけ期待通りに並ぶ。漢字は読みが分からないので文字コード順になる */
+export type SortKey = 'new' | 'old' | 'name';
+
 export interface Settings {
   speed: number;
   autoplayNext: boolean;
   autoArchive: boolean;
   /** 連続再生のときに順番でなく無作為に選ぶ。既定はOFF */
   shuffle: boolean;
+  /** 一覧の並び順。ビューごとに覚える（用途が違うので） */
+  sort: Record<string, SortKey>;
   /** ビューごとに一度スワイプしたか。操作ガイドを出すか判断するのに使う */
   swipeHintDone: Record<string, boolean>;
 }
@@ -40,7 +45,11 @@ export interface DB {
   migrations: Record<string, boolean>;
 }
 
-const DEFAULTS: Settings = { speed: 1, autoplayNext: true, autoArchive: true, shuffle: false, swipeHintDone: {} };
+const DEFAULT_SORT: Record<string, SortKey> = { inbox: 'new', archive: 'new', favorite: 'new' };
+const DEFAULTS: Settings = {
+  speed: 1, autoplayNext: true, autoArchive: true, shuffle: false,
+  sort: DEFAULT_SORT, swipeHintDone: {},
+};
 
 let cache: DB | null = null;
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -56,8 +65,12 @@ export async function loadDB(): Promise<DB> {
       pending: Array.isArray(parsed.pending) ? parsed.pending : [],
       migrations: parsed.migrations ?? {},
     };
-    // 旧バージョンの保存データにはキーが無いので補う
-    if (!cache.settings.swipeHintDone) cache.settings.swipeHintDone = {};
+    // 旧バージョンの保存データにはキーが無いので補う。
+    // DEFAULTS の中のオブジェクトをそのまま使うと、書き換えたときに
+    // DEFAULTS 自体を汚してしまうので必ず複製する。
+    const ps = parsed.settings ?? {};
+    cache.settings.swipeHintDone = { ...(ps.swipeHintDone ?? {}) };
+    cache.settings.sort = { ...DEFAULT_SORT, ...(ps.sort ?? {}) };
     if (typeof cache.settings.shuffle !== 'boolean') cache.settings.shuffle = false;
 
     // 自動アーカイブが失敗し続けていた頃（v0.2未満）に手で切ったまま、という状態が
@@ -69,7 +82,11 @@ export async function loadDB(): Promise<DB> {
       persist();
     }
   } catch {
-    cache = { positions: {}, settings: { ...DEFAULTS }, pending: [], migrations: {} };
+    cache = {
+      positions: {},
+      settings: { ...DEFAULTS, sort: { ...DEFAULT_SORT }, swipeHintDone: {} },
+      pending: [], migrations: {},
+    };
   }
   return cache;
 }

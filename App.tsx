@@ -27,7 +27,7 @@ import {
   DISCOVERY, Track, MovedMeta, listPodcast, getTemporaryLink, moveToDir, moveToPath,
   moveToTrash, saveTokens, hasRefreshToken, clearTokens, migrateKeychainAccessibility,
 } from './src/dropbox';
-import { DB, loadDB, persist, queueMove, remapPosition } from './src/store';
+import { DB, SortKey, loadDB, persist, queueMove, remapPosition } from './src/store';
 import { ErrorInfo, describeError } from './src/errors';
 import Constants from 'expo-constants';
 import { loadSigningExpiry, fmtExpiry, remainingLabel } from './src/signing';
@@ -86,6 +86,14 @@ const SWIPE: Record<ViewName, SwipeSet> = {
   inbox:    { shallow: A_ARCHIVE,  deep: A_FAVORITE },
   archive:  { shallow: A_FAVORITE, deep: A_TRASH, right: A_INBOX },
   favorite: { shallow: A_ARCHIVE_BACK, right: A_ARCHIVE_BACK },
+};
+
+/** 並び順。ボタンには短い方を出し、選択肢には説明つきの方を出す */
+const SORT_SHORT: Record<SortKey, string> = { new: '新着', old: '古い', name: '名前' };
+const SORT_LONG: Record<SortKey, string> = {
+  new: '新しい順',
+  old: '古い順',
+  name: '名前順（かな始まりのみ期待通り）',
 };
 
 /** 各ビューで一度スワイプするまで出す操作ガイド（使ったら消える） */
@@ -404,13 +412,16 @@ export default function App() {
     return () => sub.remove();
   }, [flushPending, reload, showToast]);
 
-  const visible = useMemo(
-    () =>
-      tracks
-        .filter((t) => t.view === view)
-        .sort((a, b) => (b.serverModified || '').localeCompare(a.serverModified || '')),
-    [tracks, view],
-  );
+  const sortKey: SortKey = db?.settings.sort?.[view] ?? 'new';
+  const visible = useMemo(() => {
+    const list = tracks.filter((t) => t.view === view);
+    const byTime = (a: Track, b: Track) =>
+      (a.serverModified || '').localeCompare(b.serverModified || '');
+    if (sortKey === 'old') return list.sort(byTime);
+    // 名前順: 漢字は読みが分からないので文字コード順になる（かな始まりだけ期待通り）
+    if (sortKey === 'name') return list.sort((a, b) => a.name.localeCompare(b.name, 'ja'));
+    return list.sort((a, b) => byTime(b, a));
+  }, [tracks, view, sortKey]);
   const counts = useMemo(() => {
     const c = { inbox: 0, archive: 0, favorite: 0 };
     for (const t of tracks) if (t.view !== 'trash') c[t.view as ViewName]++;
@@ -729,6 +740,27 @@ export default function App() {
     return r && r.dur > 0 ? Math.min(1, r.pos / r.dur) : 0;
   };
 
+  const pickSort = () => {
+    const opts: SortKey[] = ['new', 'old', 'name'];
+    Alert.alert(
+      '並び順',
+      `いまは「${SORT_LONG[sortKey]}」`,
+      [
+        ...opts.map((k) => ({
+          text: k === sortKey ? `${SORT_LONG[k]}  ✓` : SORT_LONG[k],
+          onPress: () => {
+            if (!db) return;
+            db.settings.sort = { ...db.settings.sort, [view]: k };
+            persist();
+            setDb({ ...db });
+            Haptics.selectionAsync().catch(() => {});
+          },
+        })),
+        { text: 'キャンセル', style: 'cancel' as const },
+      ],
+    );
+  };
+
   const reconnect = () =>
     Alert.alert('Dropbox に接続し直しますか？', '再生位置・お気に入りの設定は消えません。', [
       { text: 'キャンセル', style: 'cancel' },
@@ -787,7 +819,10 @@ export default function App() {
             </Pressable>
           ))}
         </ScrollView>
-        <Pressable style={press(s.gearBtn, { opacity: 0.6 })} onPress={() => setSettingsOpen(true)} hitSlop={10}>
+        <Pressable style={press(s.gearBtn, { opacity: 0.6 })} onPress={pickSort} hitSlop={8}>
+          <Text style={s.sortBtn}>{SORT_SHORT[sortKey]} ▾</Text>
+        </Pressable>
+        <Pressable style={press(s.gearBtn, { opacity: 0.6 })} onPress={() => setSettingsOpen(true)} hitSlop={8}>
           <Text style={s.signout}>設定</Text>
         </Pressable>
       </View>
@@ -1206,7 +1241,8 @@ const s = StyleSheet.create({
   },
   tabsScroll: { flexGrow: 1, flexShrink: 1 },
   tabsScrollInner: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingRight: 6 },
-  gearBtn: { flexGrow: 0, flexShrink: 0, paddingHorizontal: 10, paddingVertical: 7 },
+  gearBtn: { flexGrow: 0, flexShrink: 0, paddingHorizontal: 8, paddingVertical: 7 },
+  sortBtn: { color: C.dim, fontSize: 12 },
   tab: { paddingHorizontal: 13, paddingVertical: 7, borderRadius: 18, backgroundColor: C.elev1 },
   tabActive: { backgroundColor: C.accentSoft },
   tabText: { color: C.dim, fontSize: 13 },
