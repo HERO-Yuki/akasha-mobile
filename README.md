@@ -19,6 +19,37 @@ Dropbox の `/podcast` を参照するポッドキャスト風音声プレイヤ
 - エラーは「コード + 原因 + 対処 + 生ログ」の4点で表示（v0.2）
 - **署名期限のカウントダウン**（v0.3）。残り3日を切ると警告バーが出る
 
+## 🚨 依存バージョンの落とし穴（v0.3.4 で解消）
+
+**v0.3.3 は実機で起動直後にクラッシュした。** ビルドもバンドルも通るのに、
+dyld がシンボルを解決できずに abort する。
+
+```
+namespace: DYLD   indicator: "Symbol missing"
+Symbol not found: ExpoModulesCore.BaseModule.willDestroy()
+  Referenced from: ExpoFileSystem.framework
+  Expected in:     ExpoModulesCore.framework
+```
+
+原因は **`npx expo install expo-file-system` が SDK内の最新（57.0.5）を入れたこと**。
+このプロジェクトは `expo@57.0.7` / `expo-modules-core@57.0.6` に固定されており、
+57.0.5 の ExpoFileSystem はもっと新しい core の API を参照していた。
+
+- `expo@57.0.7` は**もともと `expo-file-system@57.0.1` を推移的に同梱**しており、
+  `ExpoFileSystem.framework` は v0.2.2 の時点でも積まれて正常に読み込まれていた。
+  **明示インストールがそれを 57.0.5 へ引き上げたことが事故の全て**
+- 対策は **`expo-file-system` を `57.0.1` に完全固定**（`--save-exact`）。
+  フレームワークは動作実績のあるものに戻る
+
+> [!warning] **`expo install` は「SDK内の最新」を入れる。プロジェクトの固定版とは限らない。**
+> ネイティブモジュールを足すときは、**`expo` が既に同梱していないか**を先に見る
+> （`npm ls <pkg>`）。同梱があるなら**その版に固定する**。
+> `npx expo install --check` でプロジェクト全体が古いことも確認できる
+> （このプロジェクトは expo 57.0.7 に対し期待値 ~57.0.16 と、全体的に古い）。
+>
+> **この種の不整合はCIビルドでは検出できない。** リンクは通り、実機の dyld で初めて落ちる。
+> ネイティブ依存を触った版は、実機で起動確認するまで「通った」と見なさないこと。
+
 ## 並び順（v0.3.3）
 
 ヘッダー右端、「設定」の左隣に固定のボタン（`新着 ▾` / `古い ▾` / `名前 ▾`）。
