@@ -593,31 +593,79 @@ export default function App() {
     Haptics.selectionAsync().catch(() => {});
   }, [db, player]);
 
-  /* ---------- アーカイブ一括削除（「削除の道具」に戻した） ---------- */
+  /* ---------- アーカイブ一括削除 ----------
+   * 実行するとモーダルはすぐ閉じ、あとはアプリ内のジョブとして裏で進む。
+   * 削除中も再生・スワイプ・タブ切替は普通にできる（進捗は上部のバーに出る）。
+   */
   const [bulkOpen, setBulkOpen] = useState(false);
   const [bulkDel, setBulkDel] = useState<Set<string>>(new Set()); // 選んだもの＝削除する
-  const [bulkBusy, setBulkBusy] = useState<string | null>(null);
+  const [bulkJob, setBulkJob] = useState<{ total: number; done: number; failed: number } | null>(null);
+  const bulkCancelRef = useRef(false);
   const archiveTracks = useMemo(() => tracks.filter((t) => t.view === 'archive'), [tracks]);
 
   const runBulk = useCallback(async () => {
-    const toTrash = archiveTracks.filter((t) => bulkDel.has(t.pathLower));
+    const targets = archiveTracks.filter((t) => bulkDel.has(t.pathLower));
+    if (!targets.length) return;
+
+    // 先に閉じる。ここから先は裏で進む
+    setBulkOpen(false);
+    setBulkDel(new Set());
+    bulkCancelRef.current = false;
+    setBulkJob({ total: targets.length, done: 0, failed: 0 });
+
     let done = 0;
-    try {
-      for (const t of toTrash) {
-        setBulkBusy(`${TRASH_DIR} へ移動中… ${++done}/${toTrash.length}`);
-        await moveToTrash(t);
+    let failed = 0;
+    let lastInfo: ErrorInfo | null = null;
+
+    for (const t of targets) {
+      if (bulkCancelRef.current) break;
+      try {
+        const meta = await moveToTrash({ pathLower: t.pathLower, name: t.name });
+        const d = await loadDB();
+        remapPosition(d, t.pathLower, meta.pathLower);
+        applyMoved(t.pathLower, meta, 'trash');   // 1件ずつ一覧から消える
+        done++;
+      } catch (e) {
+        const info = describeError(e);
+        if (info.kind === 'gone') {
+          done++;   // すでに無い＝目的は達成されている
+        } else {
+          failed++;
+          lastInfo = info;
+          // 端末ロック・通信断は後で自動再試行できるよう積んでおく
+          if (info.kind === 'keychain_locked' || info.kind === 'network') {
+            const d = await loadDB();
+            queueMove(d, { pathLower: t.pathLower, name: t.name, dest: TRASH_DIR, lastError: info.code });
+            setDb({ ...d });
+          }
+        }
       }
-      setBulkOpen(false);
-      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
-      showToast(`${done}件を ${TRASH_DIR} へ移動しました`);
-      await reload();
-    } catch (e) {
-      setBulkOpen(false);
-      setErrModal({ title: '一括削除に失敗', info: describeError(e) });
-    } finally {
-      setBulkBusy(null);
+      // 1件ごとに進捗を更新（途中で失敗しても止めない）
+      setBulkJob((j) => (j ? { ...j, done, failed } : j));
     }
-  }, [archiveTracks, bulkDel, reload, showToast]);
+
+    const cancelled = bulkCancelRef.current;
+    setBulkJob(null);
+    Haptics.notificationAsync(
+      failed > 0 ? Haptics.NotificationFeedbackType.Warning : Haptics.NotificationFeedbackType.Success,
+    ).catch(() => {});
+
+    if (failed > 0 && lastInfo) {
+      showToast(`${done}件を移動、${failed}件が失敗（${lastInfo.code}）`);
+      setErrModal({ title: `一括削除で ${failed}件が失敗`, info: lastInfo });
+    } else if (cancelled) {
+      showToast(`中止しました（${done}/${targets.length}件は移動済み）`);
+    } else {
+      showToast(`${done}件を ${TRASH_DIR} へ移動しました`);
+    }
+  }, [archiveTracks, bulkDel, applyMoved, showToast]);
+
+  const cancelBulk = useCallback(() => {
+    Alert.alert('一括削除を中止しますか？', '途中まで移動したものは戻りません。', [
+      { text: '続ける', style: 'cancel' },
+      { text: '中止', style: 'destructive', onPress: () => { bulkCancelRef.current = true; } },
+    ]);
+  }, []);
 
   /* ---------- UI ---------- */
   if (authed === null || !db) {
@@ -700,6 +748,21 @@ export default function App() {
         </Pressable>
       </View>
 
+      {bulkJob && (
+        <Pressable style={press(s.bulkProgress)} onPress={cancelBulk}>
+          <View
+            style={[
+              s.bulkProgressFill,
+              { width: `${((bulkJob.done + bulkJob.failed) / bulkJob.total) * 100}%` },
+            ]}
+          />
+          <Text style={s.bulkProgressText}>
+            {TRASH_DIR} へ移動中… {bulkJob.done + bulkJob.failed}/{bulkJob.total}
+            {bulkJob.failed > 0 ? `（失敗 ${bulkJob.failed}）` : ''} — タップで中止
+          </Text>
+        </Pressable>
+      )}
+
       {signMsLeft != null && signMsLeft < SIGN_WARN_DAYS * 86400000 && (
         <Pressable
           style={press(signUrgent ? s.signBarUrgent : s.signBar)}
@@ -750,7 +813,7 @@ export default function App() {
         </Pressable>
       )}
 
-      {view === 'archive' && archiveTracks.length > 0 && (
+      {view === 'archive' && archiveTracks.length > 0 && !bulkJob && (
         <Pressable
           style={press(s.bulkBtn)}
           onPress={() => { setBulkDel(new Set()); setBulkOpen(true); }}
@@ -995,22 +1058,24 @@ export default function App() {
                 );
               }}
             />
-            {bulkBusy ? (
-              <Text style={s.bulkBusy}>{bulkBusy}</Text>
-            ) : (
-              <View style={s.modalBtns}>
-                <Pressable style={press([s.btn, s.btnGhost] as ViewStyle[])} onPress={() => setBulkOpen(false)}>
-                  <Text style={[s.btnText, { color: C.text }]}>キャンセル</Text>
-                </Pressable>
-                <Pressable
-                  style={press([s.btn, bulkDel.size === 0 && s.btnDisabled] as ViewStyle[])}
-                  disabled={bulkDel.size === 0}
-                  onPress={runBulk}
-                >
-                  <Text style={s.btnText}>削除 {bulkDel.size}件を実行</Text>
-                </Pressable>
-              </View>
-            )}
+            <Text style={s.bulkNote}>
+              実行するとこの画面は閉じ、あとは裏で進みます。
+            </Text>
+            <Text style={s.bulkNote}>
+              削除中も再生・スワイプ・タブ切替は普通に使えます（進捗は画面上部に出ます）。
+            </Text>
+            <View style={s.modalBtns}>
+              <Pressable style={press([s.btn, s.btnGhost] as ViewStyle[])} onPress={() => setBulkOpen(false)}>
+                <Text style={[s.btnText, { color: C.text }]}>キャンセル</Text>
+              </Pressable>
+              <Pressable
+                style={press([s.btn, bulkDel.size === 0 && s.btnDisabled] as ViewStyle[])}
+                disabled={bulkDel.size === 0}
+                onPress={runBulk}
+              >
+                <Text style={s.btnText}>削除 {bulkDel.size}件を実行</Text>
+              </Pressable>
+            </View>
           </View>
         </View>
       </Modal>
@@ -1164,6 +1229,16 @@ const s = StyleSheet.create({
   bulkName: { flex: 1, color: C.text, fontSize: 13 },
   bulkTag: { color: C.faint, fontSize: 11 },
   bulkTagDel: { color: C.danger, fontWeight: '700' },
-  bulkBusy: { color: C.accentStrong, textAlign: 'center', paddingVertical: 10 },
+  bulkNote: { color: C.faint, fontSize: 11, lineHeight: 17, marginTop: 4 },
+  bulkProgress: {
+    marginHorizontal: 14, marginBottom: 8, paddingVertical: 7, paddingHorizontal: 10,
+    borderRadius: 9, backgroundColor: C.elev2, borderWidth: 1, borderColor: C.danger,
+    overflow: 'hidden', justifyContent: 'center',
+  },
+  bulkProgressFill: {
+    position: 'absolute', left: 0, top: 0, bottom: 0,
+    backgroundColor: 'rgba(224,108,108,0.22)',
+  },
+  bulkProgressText: { color: C.danger, fontSize: 12, fontWeight: '600' },
   modalBtns: { flexDirection: 'row', gap: 10, justifyContent: 'flex-end', marginTop: 10 },
 });
