@@ -16,6 +16,8 @@ export interface Settings {
   speed: number;
   autoplayNext: boolean;
   autoArchive: boolean;
+  /** 連続再生のときに順番でなく無作為に選ぶ。既定はOFF */
+  shuffle: boolean;
   /** ビューごとに一度スワイプしたか。操作ガイドを出すか判断するのに使う */
   swipeHintDone: Record<string, boolean>;
 }
@@ -34,9 +36,11 @@ export interface DB {
   positions: Record<string, PositionRecord>;
   settings: Settings;
   pending: PendingMove[];
+  /** 一度きりの移行処理を二度走らせないための記録 */
+  migrations: Record<string, boolean>;
 }
 
-const DEFAULTS: Settings = { speed: 1, autoplayNext: true, autoArchive: true, swipeHintDone: {} };
+const DEFAULTS: Settings = { speed: 1, autoplayNext: true, autoArchive: true, shuffle: false, swipeHintDone: {} };
 
 let cache: DB | null = null;
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -50,11 +54,22 @@ export async function loadDB(): Promise<DB> {
       positions: parsed.positions ?? {},
       settings: { ...DEFAULTS, ...(parsed.settings ?? {}) },
       pending: Array.isArray(parsed.pending) ? parsed.pending : [],
+      migrations: parsed.migrations ?? {},
     };
     // 旧バージョンの保存データにはキーが無いので補う
     if (!cache.settings.swipeHintDone) cache.settings.swipeHintDone = {};
+    if (typeof cache.settings.shuffle !== 'boolean') cache.settings.shuffle = false;
+
+    // 自動アーカイブが失敗し続けていた頃（v0.2未満）に手で切ったまま、という状態が
+    // 実際にあった。原因は解消済みなので **一度だけ** 既定のONへ戻す。
+    // 以後にユーザーが切った場合はそのまま尊重する（このフラグで二度目は走らない）。
+    if (!cache.migrations.autoArchiveResetV032) {
+      cache.settings.autoArchive = true;
+      cache.migrations.autoArchiveResetV032 = true;
+      persist();
+    }
   } catch {
-    cache = { positions: {}, settings: { ...DEFAULTS }, pending: [] };
+    cache = { positions: {}, settings: { ...DEFAULTS }, pending: [], migrations: {} };
   }
   return cache;
 }

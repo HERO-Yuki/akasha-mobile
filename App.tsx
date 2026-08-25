@@ -29,7 +29,10 @@ import {
 } from './src/dropbox';
 import { DB, loadDB, persist, queueMove, remapPosition } from './src/store';
 import { ErrorInfo, describeError } from './src/errors';
+import Constants from 'expo-constants';
 import { loadSigningExpiry, fmtExpiry, remainingLabel } from './src/signing';
+
+const APP_VERSION = Constants.expoConfig?.version ?? '?';
 
 WebBrowser.maybeCompleteAuthSession();
 
@@ -485,6 +488,11 @@ export default function App() {
   const qIndexRef = useRef(-1);
   const currentRef = useRef<Track | null>(null);
   currentRef.current = current;
+  /** step() から最新の設定を読むための参照（依存に db を入れると毎回作り直しになる） */
+  const dbRef = useRef<DB | null>(null);
+  dbRef.current = db;
+  /** ランダム再生で「もう流した」ものを覚えておき、一巡するまで重複させない */
+  const shufflePlayedRef = useRef<Set<string>>(new Set());
   const finishHandled = useRef(false);
 
   const playTrack = useCallback(
@@ -497,6 +505,7 @@ export default function App() {
         queueRef.current = queue;
         qIndexRef.current = index;
         finishHandled.current = false;
+        shufflePlayedRef.current.add(track.pathLower);
         const url = await getTemporaryLink(track.pathLower);
         player.replace({ uri: url });
         const d = await loadDB();
@@ -523,6 +532,23 @@ export default function App() {
   const step = useCallback(
     (delta: number) => {
       const q = queueRef.current;
+      if (!q.length) return;
+
+      // ランダム再生: まだ流していないものから無作為に選ぶ
+      if (delta > 0 && dbRef.current?.settings.shuffle) {
+        const cur = q[qIndexRef.current];
+        let pool = q.filter((t) => !shufflePlayedRef.current.has(t.pathLower));
+        if (!pool.length) {
+          // 一巡したので履歴を畳む。直前の1曲だけは続けて流さない
+          shufflePlayedRef.current = new Set(cur ? [cur.pathLower] : []);
+          pool = q.filter((t) => t.pathLower !== cur?.pathLower);
+        }
+        if (!pool.length) { showToast('最後まで聴き終えました'); return; }
+        const pick = pool[Math.floor(Math.random() * pool.length)];
+        playTrack(pick, q, q.indexOf(pick));
+        return;
+      }
+
       const next = qIndexRef.current + delta;
       if (next >= 0 && next < q.length) {
         playTrack(q[next], q, next);
@@ -597,6 +623,7 @@ export default function App() {
    * 実行するとモーダルはすぐ閉じ、あとはアプリ内のジョブとして裏で進む。
    * 削除中も再生・スワイプ・タブ切替は普通にできる（進捗は上部のバーに出る）。
    */
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [bulkOpen, setBulkOpen] = useState(false);
   const [bulkDel, setBulkDel] = useState<Set<string>>(new Set()); // 選んだもの＝削除する
   const [bulkJob, setBulkJob] = useState<{ total: number; done: number; failed: number } | null>(null);
@@ -702,13 +729,22 @@ export default function App() {
     return r && r.dur > 0 ? Math.min(1, r.pos / r.dur) : 0;
   };
 
+  const reconnect = () =>
+    Alert.alert('Dropbox に接続し直しますか？', '再生位置・お気に入りの設定は消えません。', [
+      { text: 'キャンセル', style: 'cancel' },
+      {
+        text: '接続し直す',
+        onPress: async () => { setSettingsOpen(false); await clearTokens(); setAuthed(false); },
+      },
+    ]);
+
   const disconnect = () =>
     Alert.alert('Dropbox 接続を解除しますか？', '', [
       { text: 'キャンセル', style: 'cancel' },
       {
         text: '解除',
         style: 'destructive',
-        onPress: async () => { await clearTokens(); setAuthed(false); },
+        onPress: async () => { setSettingsOpen(false); await clearTokens(); setAuthed(false); },
       },
     ]);
 
@@ -723,28 +759,36 @@ export default function App() {
     <SafeAreaView style={s.root}>
       <StatusBar barStyle="light-content" />
 
-      {/* view tabs（ロゴ行は廃止。接続解除はここに畳んだ） */}
+      {/* view tabs
+        * 件数が増えるとラベルが伸びて右端が切れていたので、タブだけ横スクロールにし、
+        * 「設定」は縮まない枠に固定した（設定が押せなくなると詰むため）。 */}
       <View style={s.tabs}>
-        {(
-          [
-            ['inbox', 'Inbox', counts.inbox],
-            ['archive', 'アーカイブ', counts.archive],
-            ['favorite', 'お気に入り', counts.favorite],
-          ] as Array<[ViewName, string, number]>
-        ).map(([v, label, n]) => (
-          <Pressable
-            key={v}
-            style={press([s.tab, view === v && s.tabActive] as ViewStyle[], { opacity: 0.6 })}
-            onPress={() => { setView(v); Haptics.selectionAsync().catch(() => {}); }}
-          >
-            <Text style={[s.tabText, view === v && s.tabTextActive]}>
-              {label}{n > 0 ? ` ${n}` : ''}
-            </Text>
-          </Pressable>
-        ))}
-        <View style={{ flex: 1 }} />
-        <Pressable onPress={disconnect} hitSlop={10}>
-          <Text style={s.signout}>接続解除</Text>
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          style={s.tabsScroll}
+          contentContainerStyle={s.tabsScrollInner}
+        >
+          {(
+            [
+              ['inbox', 'Inbox', counts.inbox],
+              ['archive', 'アーカイブ', counts.archive],
+              ['favorite', 'お気に入り', counts.favorite],
+            ] as Array<[ViewName, string, number]>
+          ).map(([v, label, n]) => (
+            <Pressable
+              key={v}
+              style={press([s.tab, view === v && s.tabActive] as ViewStyle[], { opacity: 0.6 })}
+              onPress={() => { setView(v); Haptics.selectionAsync().catch(() => {}); }}
+            >
+              <Text style={[s.tabText, view === v && s.tabTextActive]} numberOfLines={1}>
+                {label}{n > 0 ? ` ${n}` : ''}
+              </Text>
+            </Pressable>
+          ))}
+        </ScrollView>
+        <Pressable style={press(s.gearBtn, { opacity: 0.6 })} onPress={() => setSettingsOpen(true)} hitSlop={10}>
+          <Text style={s.signout}>設定</Text>
         </Pressable>
       </View>
 
@@ -951,19 +995,74 @@ export default function App() {
         </View>
         <View style={s.togglesRow}>
           <Pressable
-            onPress={() => { db.settings.autoplayNext = !db.settings.autoplayNext; persist(); setDb({ ...db }); }}
+            onPress={() => {
+              db.settings.autoplayNext = !db.settings.autoplayNext;
+              persist(); setDb({ ...db });
+              Haptics.selectionAsync().catch(() => {});
+            }}
           >
             <Text style={[s.toggle, db.settings.autoplayNext && s.toggleOn]}>連続再生</Text>
           </Pressable>
           <Pressable
-            onPress={() => { db.settings.autoArchive = !db.settings.autoArchive; persist(); setDb({ ...db }); }}
+            onPress={() => {
+              db.settings.shuffle = !db.settings.shuffle;
+              shufflePlayedRef.current = new Set(current ? [current.pathLower] : []);
+              persist(); setDb({ ...db });
+              Haptics.selectionAsync().catch(() => {});
+            }}
           >
-            <Text style={[s.toggle, db.settings.autoArchive && s.toggleOn]}>
-              聴き終えたら自動アーカイブ
-            </Text>
+            <Text style={[s.toggle, db.settings.shuffle && s.toggleOn]}>ランダム再生</Text>
           </Pressable>
         </View>
       </View>
+
+      {/* 設定（普段は触らないものをここに集約） */}
+      <Modal visible={settingsOpen} animationType="slide" transparent onRequestClose={() => setSettingsOpen(false)}>
+        <View style={s.modalWrap}>
+          <View style={s.modal}>
+            <Text style={s.modalTitle}>設定</Text>
+
+            <Pressable
+              style={press(s.setRow, { backgroundColor: C.hover })}
+              onPress={() => {
+                db.settings.autoArchive = !db.settings.autoArchive;
+                persist(); setDb({ ...db });
+                Haptics.selectionAsync().catch(() => {});
+              }}
+            >
+              <View style={{ flex: 1, minWidth: 0 }}>
+                <Text style={s.setLabel}>聴き終えたら自動アーカイブ</Text>
+                <Text style={s.setSub}>95%まで聴いたら Inbox から {ARCHIVE_DIR} へ移す</Text>
+              </View>
+              <Text style={[s.setState, db.settings.autoArchive && s.setStateOn]}>
+                {db.settings.autoArchive ? 'ON' : 'OFF'}
+              </Text>
+            </Pressable>
+
+            <Text style={s.setSection}>Dropbox</Text>
+            <Pressable style={press(s.setRow, { backgroundColor: C.hover })} onPress={reconnect}>
+              <Text style={[s.setLabel, { flex: 1 }]}>接続し直す</Text>
+              <Text style={s.setSub}>認証が切れたときに</Text>
+            </Pressable>
+            <Pressable style={press(s.setRow, { backgroundColor: C.hover })} onPress={disconnect}>
+              <Text style={[s.setLabel, { flex: 1, color: C.danger }]}>接続を解除</Text>
+            </Pressable>
+
+            <Text style={s.setSection}>情報</Text>
+            <Text style={s.setInfo}>バージョン {APP_VERSION}</Text>
+            <Text style={s.setInfo}>
+              署名の期限 {expiry ? fmtExpiry(expiry) : '—'}
+              {signMsLeft != null ? `（${remainingLabel(signMsLeft)}）` : ''}
+            </Text>
+
+            <View style={s.modalBtns}>
+              <Pressable style={press(s.btn)} onPress={() => setSettingsOpen(false)}>
+                <Text style={s.btnText}>閉じる</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
 
       {/* エラー詳細（コード + 原因 + 対処） */}
       <Modal visible={!!errModal} animationType="fade" transparent onRequestClose={() => setErrModal(null)}>
@@ -1102,9 +1201,12 @@ const s = StyleSheet.create({
   warn: { color: C.danger, fontSize: 12, marginTop: 8 },
   signout: { color: C.faint, fontSize: 12 },
   tabs: {
-    flexDirection: 'row', alignItems: 'center', gap: 6,
-    paddingHorizontal: 14, paddingTop: 6, paddingBottom: 8,
+    flexDirection: 'row', alignItems: 'center',
+    paddingLeft: 14, paddingRight: 6, paddingTop: 6, paddingBottom: 8,
   },
+  tabsScroll: { flexGrow: 1, flexShrink: 1 },
+  tabsScrollInner: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingRight: 6 },
+  gearBtn: { flexGrow: 0, flexShrink: 0, paddingHorizontal: 10, paddingVertical: 7 },
   tab: { paddingHorizontal: 13, paddingVertical: 7, borderRadius: 18, backgroundColor: C.elev1 },
   tabActive: { backgroundColor: C.accentSoft },
   tabText: { color: C.dim, fontSize: 13 },
@@ -1211,6 +1313,17 @@ const s = StyleSheet.create({
     borderRadius: 14, backgroundColor: C.elev2,
   },
   selectAllText: { color: C.dim, fontSize: 12 },
+  setRow: {
+    flexDirection: 'row', alignItems: 'center', gap: 10,
+    paddingVertical: 11, paddingHorizontal: 12, borderRadius: 10,
+    backgroundColor: C.elev2, marginTop: 6,
+  },
+  setLabel: { color: C.text, fontSize: 14 },
+  setSub: { color: C.faint, fontSize: 11, marginTop: 2 },
+  setState: { color: C.faint, fontSize: 13, fontWeight: '700', minWidth: 34, textAlign: 'right' },
+  setStateOn: { color: C.accentStrong },
+  setSection: { color: C.faint, fontSize: 11, marginTop: 14, letterSpacing: 0.5 },
+  setInfo: { color: C.dim, fontSize: 12, marginTop: 4 },
   errLabel: { color: C.faint, fontSize: 11, marginTop: 6, letterSpacing: 0.5 },
   errBody: { color: C.text, fontSize: 13, lineHeight: 19 },
   errCode: {
