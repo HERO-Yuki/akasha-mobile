@@ -27,12 +27,24 @@ import {
   DISCOVERY, Track, MovedMeta, listPodcast, getTemporaryLink, moveToDir, moveToPath,
   moveToTrash, saveTokens, hasRefreshToken, clearTokens, migrateKeychainAccessibility,
 } from './src/dropbox';
-import { DB, SortKey, loadDB, persist, queueMove, remapPosition } from './src/store';
+import {
+  DB, SortKey, loadDB, persist, queueMove, remapPosition, loadTrackCache, saveTrackCache, clearTrackCache,
+} from './src/store';
 import { ErrorInfo, describeError } from './src/errors';
 import Constants from 'expo-constants';
 import { loadSigningExpiry, fmtExpiry, remainingLabel } from './src/signing';
 
 const APP_VERSION = Constants.expoConfig?.version ?? '?';
+
+/** 「18:55」のような時刻だけの表示。日をまたいだら「9/12 18:55」 */
+function fmtClock(ms: number): string {
+  const d = new Date(ms);
+  const hm = `${d.getHours()}:${String(d.getMinutes()).padStart(2, '0')}`;
+  const now = new Date();
+  const sameDay = d.getFullYear() === now.getFullYear()
+    && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
+  return sameDay ? hm : `${d.getMonth() + 1}/${d.getDate()} ${hm}`;
+}
 
 WebBrowser.maybeCompleteAuthSession();
 
@@ -280,6 +292,20 @@ function SwipeableRow({
 export default function App() {
   /* ---------- auth ---------- */
   const [authed, setAuthed] = useState<boolean | null>(null);
+
+  /** 接続解除。トークンと一緒に一覧のキャッシュも捨てる（別アカウントの一覧を見せないため） */
+  const signOut = useCallback(async () => {
+    await clearTokens();
+    clearTrackCache();
+    listAtRef.current = null;
+    freshLoaded.current = false;
+    staleRef.current = false;
+    setListAt(null);
+    setTracks([]);
+    setError(null);
+    setErrInfo(null);
+    setAuthed(false);
+  }, []);
   const [request, response, promptAsync] = useAuthRequest(
     {
       clientId: DROPBOX_APP_KEY,
@@ -345,10 +371,28 @@ export default function App() {
   const [nowMs, setNowMs] = useState(() => Date.now());
   const handleSwipeActive = useCallback((a: boolean) => setSwiping(a), []);
   const [error, setError] = useState<string | null>(null);
+  const [errInfo, setErrInfo] = useState<ErrorInfo | null>(null);
+  // いま画面に出ている一覧を Dropbox から取った時刻。null は一度も取れていない。
+  // reload の依存に入れると取得のたびに reload が作り直されて再発火するので ref にも写す
+  const [listAt, setListAt] = useState<number | null>(null);
+  const listAtRef = useRef<number | null>(null);
+  // 一覧が最新でない（キャッシュを見せている／直前の取得に失敗した）。
+  // AppState の復帰ハンドラから見るので ref で持つ
+  const staleRef = useRef(false);
+  const freshLoaded = useRef(false);   // 起動後に一度でも Dropbox から取れたか
+  const loadingRef = useRef(false);    // 引き下げ更新と復帰時の自動更新が重ならないように
 
   useEffect(() => {
     loadDB().then(setDb);
     loadSigningExpiry().then(setExpiry);
+    // 前回の一覧を先に出しておく。圏外でも「空です」にならず、取れ次第差し替わる
+    loadTrackCache().then((c) => {
+      if (!c || freshLoaded.current) return;
+      setTracks(c.tracks);
+      setListAt(c.at);
+      listAtRef.current = c.at;
+      staleRef.current = true;
+    });
     setAudioModeAsync({
       playsInSilentMode: true,
       shouldPlayInBackground: true,
@@ -372,6 +416,12 @@ export default function App() {
         // 元ファイルが無い＝すでに移動済み。キューから外してよい
         if (info.kind === 'gone') { done++; continue; }
         remaining.push({ ...p, tries: p.tries + 1, lastError: info.code });
+        // 圏外なら残りも全部落ちる。1件ごとに再試行の待ち（最大7秒）を払わず打ち切る
+        if (info.kind === 'network') {
+          const idx = d.pending.indexOf(p);
+          remaining.push(...d.pending.slice(idx + 1));
+          break;
+        }
       }
     }
     d.pending = remaining;
@@ -381,16 +431,29 @@ export default function App() {
   }, []);
 
   const reload = useCallback(async () => {
+    if (loadingRef.current) return;
+    loadingRef.current = true;
     setLoading(true);
     setError(null);
+    setErrInfo(null);
     try {
       await flushPending().catch(() => 0);
-      setTracks(await listPodcast());
+      const list = await listPodcast();
+      const at = Date.now();
+      freshLoaded.current = true;
+      listAtRef.current = at;
+      staleRef.current = false;
+      setListAt(at);
+      setTracks(list);   // キャッシュへの保存は tracks を見ている effect が行う
     } catch (e) {
       const info = describeError(e);
       setError(`${info.cause}（${info.code}）`);
-      setErrModal({ title: '一覧の取得に失敗', info });
+      setErrInfo(info);
+      // 手元に一覧があればそれを見せ続ける。何も無いときだけ即モーダルで知らせる
+      staleRef.current = true;
+      if (listAtRef.current === null) setErrModal({ title: '一覧の取得に失敗', info });
     } finally {
+      loadingRef.current = false;
       setLoading(false);
     }
   }, [flushPending]);
@@ -399,15 +462,19 @@ export default function App() {
     if (authed) reload();
   }, [authed, reload]);
 
-  // アプリに戻ってきたら、ロック中に失敗した移動を自動で片付ける
+  // アプリに戻ってきたら、ロック中に失敗した移動を自動で片付ける。
+  // 一覧が古いまま（圏外で取れなかった等）なら、そのついでに取り直す
   useEffect(() => {
     const sub = AppState.addEventListener('change', (st) => {
       if (st !== 'active') return;
       setNowMs(Date.now());
       loadSigningExpiry().then(setExpiry);   // 再署名されていれば期限が伸びている
       flushPending()
-        .then((n) => { if (n > 0) { showToast(`保留していた移動 ${n}件を完了しました`); reload(); } })
-        .catch(() => {});
+        .then((n) => {
+          if (n > 0) showToast(`保留していた移動 ${n}件を完了しました`);
+          if (n > 0 || staleRef.current) reload();
+        })
+        .catch(() => { if (staleRef.current) reload(); });
     });
     return () => sub.remove();
   }, [flushPending, reload, showToast]);
@@ -426,6 +493,13 @@ export default function App() {
     const c = { inbox: 0, archive: 0, favorite: 0 };
     for (const t of tracks) if (t.view !== 'trash') c[t.view as ViewName]++;
     return c;
+  }, [tracks]);
+
+  // 一覧が変わるたびにキャッシュも追従させる（スワイプ・自動アーカイブ・一括削除・元に戻す）。
+  // 取得時に一度だけ保存する方式だと、次回起動で移動前のパスが出て「無い物」を操作させてしまう
+  useEffect(() => {
+    if (listAtRef.current === null) return;   // まだ何も取れていない／キャッシュも無い
+    saveTrackCache(tracks, listAtRef.current);
   }, [tracks]);
 
   /** 移動が成功したら、アプリ内のパスも新しいものに差し替える */
@@ -470,11 +544,16 @@ export default function App() {
             applyMoved(meta.pathLower, back, prevView);
             showToast('元に戻しました');
           } catch (e) {
-            setErrModal({ title: '元に戻せませんでした', info: describeError(e) });
+            const info = describeError(e);
+            if (info.kind === 'gone') { showToast('すでに動かされていました。一覧を取り直します'); reload(); return; }
+            setErrModal({ title: '元に戻せませんでした', info });
           }
         });
       } catch (e) {
         const info = describeError(e);
+        // 移動は通ったのに応答だけ失われ、再試行で「元が無い」と返った場合。
+        // 目的は達成されているので画面は戻さず、正しいパスを一覧の取り直しで揃える
+        if (info.kind === 'gone') { showToast('移動済みでした。一覧を取り直します'); reload(); return; }
         setTracks((prev) => prev.map((x) => (x.pathLower === from ? { ...x, view: prevView } : x)));
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error).catch(() => {});
         if (info.kind === 'keychain_locked' || info.kind === 'network') {
@@ -487,7 +566,7 @@ export default function App() {
         }
       }
     },
-    [applyMoved, showToast],
+    [applyMoved, showToast, reload],
   );
 
   /* ---------- player ---------- */
@@ -655,7 +734,8 @@ export default function App() {
     let failed = 0;
     let lastInfo: ErrorInfo | null = null;
 
-    for (const t of targets) {
+    for (let i = 0; i < targets.length; i++) {
+      const t = targets[i];
       if (bulkCancelRef.current) break;
       try {
         const meta = await moveToTrash({ pathLower: t.pathLower, name: t.name });
@@ -674,6 +754,16 @@ export default function App() {
           if (info.kind === 'keychain_locked' || info.kind === 'network') {
             const d = await loadDB();
             queueMove(d, { pathLower: t.pathLower, name: t.name, dest: TRASH_DIR, lastError: info.code });
+            // 圏外なら残りも全部落ちる。1件ずつ待たずに、残りをまとめて保留に積んで打ち切る
+            if (info.kind === 'network') {
+              for (const r of targets.slice(i + 1)) {
+                queueMove(d, { pathLower: r.pathLower, name: r.name, dest: TRASH_DIR, lastError: info.code });
+                failed++;
+              }
+              setDb({ ...d });
+              setBulkJob((j) => (j ? { ...j, done, failed } : j));
+              break;
+            }
             setDb({ ...d });
           }
         }
@@ -766,7 +856,7 @@ export default function App() {
       { text: 'キャンセル', style: 'cancel' },
       {
         text: '接続し直す',
-        onPress: async () => { setSettingsOpen(false); await clearTokens(); setAuthed(false); },
+        onPress: async () => { setSettingsOpen(false); await signOut(); },
       },
     ]);
 
@@ -776,7 +866,7 @@ export default function App() {
       {
         text: '解除',
         style: 'destructive',
-        onPress: async () => { setSettingsOpen(false); await clearTokens(); setAuthed(false); },
+        onPress: async () => { setSettingsOpen(false); await signOut(); },
       },
     ]);
 
@@ -901,7 +991,19 @@ export default function App() {
         </Pressable>
       )}
 
-      {error && <Text style={s.error}>{error}</Text>}
+      {/* 取得に失敗しても一覧は消さない。何時のものを見せているかを添えて、タップで詳細 */}
+      {error && (
+        <Pressable
+          style={press(s.staleBar)}
+          onPress={() => errInfo && setErrModal({ title: '一覧の取得に失敗', info: errInfo })}
+        >
+          <Text style={s.staleText}>
+            {listAt !== null
+              ? `${fmtClock(listAt)} に取得した一覧を表示中（通信エラー）— 引き下げて更新／タップで詳細`
+              : `一覧を取得できていません（通信エラー）— 引き下げて再読み込み／タップで詳細`}
+          </Text>
+        </Pressable>
+      )}
 
       {/* list */}
       <FlatList
@@ -912,7 +1014,12 @@ export default function App() {
           <RefreshControl refreshing={loading} onRefresh={reload} tintColor={C.accent} />
         }
         ListEmptyComponent={
-          loading ? null : <Text style={s.empty}>{emptyText[view]}</Text>
+          loading ? null : (
+            <Text style={s.empty}>
+              {/* 取れていないだけなのに「空です」と言うと、消えたと誤解される */}
+              {error && listAt === null ? '一覧をまだ取得できていません。\n引き下げて再読み込みしてください。' : emptyText[view]}
+            </Text>
+          )
         }
         contentContainerStyle={{ paddingBottom: 180 }}
         renderItem={({ item, index }) => {
@@ -1124,7 +1231,7 @@ export default function App() {
                 errModal?.info.kind === 'token_refresh_failed') && (
                 <Pressable
                   style={press([s.btn, s.btnGhost] as ViewStyle[])}
-                  onPress={async () => { setErrModal(null); await clearTokens(); setAuthed(false); }}
+                  onPress={async () => { setErrModal(null); await signOut(); }}
                 >
                   <Text style={[s.btnText, { color: C.text }]}>接続を解除</Text>
                 </Pressable>
@@ -1272,7 +1379,11 @@ const s = StyleSheet.create({
     borderWidth: 1, borderColor: C.danger, alignItems: 'center',
   },
   bulkBtnText: { color: C.danger, fontSize: 13, fontWeight: '600' },
-  error: { color: C.danger, paddingHorizontal: 18, paddingBottom: 8, fontSize: 12 },
+  staleBar: {
+    marginHorizontal: 14, marginBottom: 8, paddingVertical: 7, paddingHorizontal: 10,
+    borderRadius: 9, backgroundColor: 'rgba(224,108,108,0.16)', borderWidth: 1, borderColor: C.danger,
+  },
+  staleText: { color: C.danger, fontSize: 12 },
   empty: { color: C.faint, textAlign: 'center', marginTop: 60, lineHeight: 22 },
   row: {
     marginHorizontal: 12, marginVertical: 3, padding: 13, borderRadius: 12,

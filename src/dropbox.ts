@@ -39,6 +39,34 @@ export interface Track {
   serverModified: string;
 }
 
+/* ---------------- 通信 ---------------- */
+
+/**
+ * 一瞬の圏外・回線切り替え・バックグラウンド復帰直後は fetch 自体が
+ * 「The network connection was lost」で落ちる。実測では list_folder/continue の
+ * 2ページ目で起きて、取れかけていた一覧ごと捨てていた（2026-09-12・5G回線）。
+ * 1s→2s→4s と待って最大3回やり直してから諦める。
+ */
+const NET_RETRY_MS = [1000, 2000, 4000];
+
+async function postWithRetry(url: string, init: RequestInit, label: string): Promise<Response> {
+  for (let i = 0; ; i++) {
+    try {
+      return await fetch(url, init);
+    } catch (e) {
+      if (i < NET_RETRY_MS.length) {
+        await new Promise((r) => setTimeout(r, NET_RETRY_MS[i]));
+        continue;
+      }
+      throw new AkashaError({
+        kind: 'network',
+        endpoint: label,
+        raw: `${label}: ${String(e)}（${i + 1}回試行して全て失敗）`,
+      });
+    }
+  }
+}
+
 /* ---------------- token 管理 ---------------- */
 
 /** 直近のアクセストークンをメモリに持ち、SecureStore への読み出し回数を減らす */
@@ -116,16 +144,11 @@ export async function getAccessToken(): Promise<string> {
     client_id: DROPBOX_APP_KEY,
   }).toString();
 
-  let res: Response;
-  try {
-    res = await fetch(DISCOVERY.tokenEndpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body,
-    });
-  } catch (e) {
-    throw new AkashaError({ kind: 'network', raw: `token refresh: ${String(e)}` });
-  }
+  const res = await postWithRetry(DISCOVERY.tokenEndpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body,
+  }, 'token refresh');
 
   if (!res.ok) {
     const text = await res.text().catch(() => '');
@@ -158,19 +181,14 @@ const RETRYABLE = /too_many_write_operations|too_many_requests/;
 async function rpc<T>(endpoint: string, arg: unknown, attempt = 0): Promise<T> {
   const token = await getAccessToken();
 
-  let res: Response;
-  try {
-    res = await fetch(`https://api.dropboxapi.com/2/${endpoint}`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(arg),
-    });
-  } catch (e) {
-    throw new AkashaError({ kind: 'network', endpoint, raw: `${endpoint}: ${String(e)}` });
-  }
+  const res = await postWithRetry(`https://api.dropboxapi.com/2/${endpoint}`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(arg),
+  }, endpoint);
 
   if (res.ok) return res.json() as Promise<T>;
 

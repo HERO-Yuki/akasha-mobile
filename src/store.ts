@@ -2,8 +2,11 @@
  * 再生位置・視聴済み・設定・保留中の移動の永続化（AsyncStorage）
  */
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import type { Track } from './dropbox';
 
 const KEY = 'akasha.v1';
+/** 一覧は再生位置とは別キーに置く。位置は再生中ずっと書き続けるので、一覧を道連れにしない */
+const TRACKS_KEY = 'akasha.tracks.v1';
 
 export interface PositionRecord {
   pos: number;
@@ -122,4 +125,35 @@ export function remapPosition(db: DB, from: string, to: string): void {
   db.positions[to] = rec;
   delete db.positions[from];
   persist();
+}
+
+/* ---------------- 一覧のキャッシュ ---------------- */
+
+/** 直近に Dropbox から取れた一覧。圏外や取得失敗のときは空にせずこれを見せる */
+export interface TrackCache {
+  at: number;        // 取得した時刻（表示用）
+  tracks: Track[];
+}
+
+export async function loadTrackCache(): Promise<TrackCache | null> {
+  try {
+    const raw = await AsyncStorage.getItem(TRACKS_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed.tracks) || typeof parsed.at !== 'number') return null;
+    return { at: parsed.at, tracks: parsed.tracks };
+  } catch {
+    return null;
+  }
+}
+
+/** at は「Dropbox から取った時刻」。手元での移動を反映して保存し直すときも取得時刻は変えない */
+export function saveTrackCache(tracks: Track[], at: number): void {
+  const c: TrackCache = { at, tracks };
+  AsyncStorage.setItem(TRACKS_KEY, JSON.stringify(c)).catch(() => {});
+}
+
+/** 接続解除のとき。別アカウントの一覧を見せないため */
+export function clearTrackCache(): void {
+  AsyncStorage.removeItem(TRACKS_KEY).catch(() => {});
 }
